@@ -87,10 +87,10 @@ struct thread
     enum thread_status status;          /**< Thread state. */
     char name[16];                      /**< Name (for debugging purposes). */
     uint8_t *stack;                     /**< Saved stack pointer. */
-    int priority;                       /**< Effective priority used by scheduler. */
+    int priority;                       /**< Priority. */
     struct list_elem allelem;           /**< List element for all threads list. */
 
-    /* Donation-related state (Task 2.1). */
+      /* Donation-related state (Task 2.1). */
     int base_priority;                  /**< Base priority set by user (no donations). */
     struct lock *waiting_lock;          /**< Lock this thread is currently blocked on (if any). */
 
@@ -99,11 +99,9 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /**< List element. */
-    struct list locks_held;             /**< List of locks held by this thread. */
-
-    /* For userprog */
-    struct list *fd_list;
-    int next_fd;
+    struct list locks_held;             /**< List of locks held by this thread.*/
+    struct list *fd_list; 
+    int next_fd;                   /**< Next file descriptor. */
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
@@ -153,18 +151,12 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
-
-/** Compares the priorities of two threads (strict > for ordering). */
 bool thread_priority_less (const struct list_elem *a, const struct list_elem *b, void *aux);
-
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
-
 /* Allow other subsystems to request a yield after priority changes. */
 void maybe_yield (void);
-
 /* Wakes up a thread that is sleeping on a timer. */
 void thread_wakeup(int64_t ticks);
 
 #endif /**< threads/thread.h */
-
