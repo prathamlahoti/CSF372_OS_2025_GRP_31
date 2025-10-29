@@ -148,10 +148,8 @@ frame_free (struct frame *f)
 {
   ASSERT (lock_held_by_current_thread (&f->lock));
           
-  /* TODO: Implement frame freeing.
-     Hint: You need to mark this frame as free again 
-     so it can be reused by other pages.
-     Do NOT remove the lock operations. */
+  /* Mark the frame as free by nullifying its page pointer. */
+  f->page = NULL;
 
   lock_release (&f->lock);
 }

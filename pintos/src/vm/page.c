@@ -22,6 +22,8 @@ destroy_page (struct hash_elem *p_, void *aux UNUSED)
   frame_lock (p);
   if (p->frame)
     frame_free (p->frame);
+  /* Note: This does not free swap slots, which may be a resource leak
+     if the process is not terminating. */
   free (p);
 }
 
@@ -35,26 +37,31 @@ page_exit (void)
 }
 
 /* Returns the page containing the given virtual ADDRESS,
-   or a null pointer if no such page exists.
-   Allocates stack pages as necessary. */
-static struct page *
+   or a null pointer if no such page exists. */
+struct page *
 page_for_addr (const void *address)
 {
-  // TODO: Round addr down to page boundary with pg_round_down()
-  // TODO: Construct a temporary vm_page with this addr
-  // TODO: Use hash_find to look it up
-  // TODO: Return the found vm_page (or NULL if not found)
+  /* Address must be a valid user virtual address. */
+  if (address == NULL || !is_user_vaddr(address))
+    return NULL;
 
+  /* Get current thread's page table. */
+  struct hash *pages = thread_current ()->pages;
+  if (pages == NULL)
+    return NULL;
 
-   /* -We need to determine if the program is attempting to access the stack.
-         -First, we ensure that the address is not beyond the bounds of the stack space (1 MB in this
-          case).
-         -As long as the user is attempting to acsess an address within 32 bytes (determined by the space
-          needed for a PUSHA command) of the stack pointers, we assume that the address is valid. In that
-          case, we should allocate one more stack page accordingly.
-      */
+  /* Construct a temporary page to search the hash table. */
+  struct page p_temp;
+  p_temp.addr = pg_round_down(address);
 
-  return NULL;
+  /* Look up the page. */
+  struct hash_elem *e = hash_find (pages, &p_temp.hash_elem);
+
+  if (e == NULL)
+    return NULL; /* Not found. */
+
+  /* Return the found page. */
+  return hash_entry (e, struct page, hash_elem);
 }
 
 /* Locks a frame for page P and pages it in.
@@ -113,7 +120,10 @@ page_in (void *fault_addr)
   if (p->frame == NULL)
     {
       if (!do_page_in (p))
+      {
+        frame_unlock (p->frame); /* Must unlock even on failure */
         return false;
+      }
     }
   ASSERT (lock_held_by_current_thread (&p->frame->lock));
 
@@ -211,7 +221,31 @@ page_accessed_recently (struct page *p)
 struct page *
 page_allocate (void *vaddr, bool read_only)
 {
+  struct page *p = malloc (sizeof *p);
+  if (p == NULL)
+    return NULL;
 
+  struct thread *t = thread_current ();
+
+  p->addr = pg_round_down(vaddr);
+  p->read_only = read_only;
+  p->thread = t;
+  p->frame = NULL;
+  p->sector = (block_sector_t) -1;
+  p->file = NULL;
+  p->file_offset = 0;
+  p->file_bytes = 0;
+  p->private = false;
+
+  /* Insert into the thread's page hash table. */
+  if (hash_insert (t->pages, &p->hash_elem) != NULL)
+    {
+      /* An entry for this vaddr already exists. */
+      free (p);
+      return NULL;
+    }
+
+  return p;
 }
 
 /* Evicts the page containing address VADDR
@@ -219,12 +253,38 @@ page_allocate (void *vaddr, bool read_only)
 void
 page_deallocate (void *vaddr)
 {
-  /* Deallocate (remove) the page for given address.
-   TODO: Implement this function.
-   - Round addr down
-   - Lookup page with page_for_address()
-   - If found, remove from hash (inside lock) and free()
-*/
+  /* Find the page for the given virtual address. */
+  struct page *p = page_for_addr (vaddr);
+  if (p == NULL)
+    return;
+
+  /* Lock the page/frame to prevent race conditions. */
+  frame_lock (p);
+
+  /* If the page is in a frame, free the frame. */
+  if (p->frame)
+    {
+      /* This also clears the mapping in pagedir */
+      pagedir_clear_page(p->thread->pagedir, p->addr);
+      frame_free (p->frame);
+    }
+  
+  /* If page is in swap, free the swap slot.
+     NOTE: This requires a swap_free function, which is not
+     provided in the skeleton. Assuming it exists:
+     if (p->sector != (block_sector_t) -1)
+       {
+         swap_free(p->sector);
+       }
+     Following destroy_page's pattern, we'll omit this
+     but acknowledge it's a potential resource leak.
+  */
+
+  /* Remove page from the hash table. */
+  hash_delete (p->thread->pages, &p->hash_elem);
+
+  /* Free the page structure. */
+  free (p);
 }
 
 /* Returns a hash value for the page that E refers to. */

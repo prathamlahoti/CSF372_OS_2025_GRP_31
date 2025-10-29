@@ -4,7 +4,11 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h" /* Added for is_user_vaddr and PHYS_BASE */
 #include "vm/page.h"
+
+/* Maximum size of process stack, in bytes. */
+#define STACK_MAX (1024 * 1024)
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -13,20 +17,7 @@ static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
 
 /* Registers handlers for interrupts that can be caused by user
-   programs.
-
-   In a real Unix-like OS, most of these interrupts would be
-   passed along to the user process in the form of signals, as
-   described in [SV-386] 3-24 and 3-25, but we don't implement
-   signals.  Instead, we'll make them simply kill the user
-   process.
-
-   Page faults are an exception.  Here they are treated the same
-   way as other exceptions, but this will need to change to
-   implement virtual memory.
-
-   Refer to [IA32-v3a] section 5.15 "Exception and Interrupt
-   Reference" for a description of each of these exceptions. */
+   programs. ... (rest of function unchanged) ... */
 void
 exception_init (void) 
 {
@@ -141,24 +132,72 @@ page_fault (struct intr_frame *f)
      be assured of reading CR2 before it changed). */
   intr_enable ();
 
+  /* Count page faults. */
+  page_fault_cnt++;
 
-  /* TODO: Determine cause of fault
-       - not_present: page not present
-       - write: access was a write
-       - user: access by user
-   */
+  /* Determine cause of fault. */
+  not_present = (f->error_code & PF_P) == 0;
+  write = (f->error_code & PF_W) != 0;
+  user = (f->error_code & PF_U) != 0;
 
-   /* TODO: Implement demand paging here
-       - Call your page_in() or similar
-       - Allocate stack pages if necessary
-       - Evict pages if needed
-       - Return to user if successful
-    */
+  /* --- BEGIN MODIFICATION --- */
 
+  /* Reject faults from kernel mode or on kernel addresses.
+     A fault in kernel mode (!user) on a user address is a kernel bug.
+     A fault on a kernel address (!is_user_vaddr) is also a kernel bug. */
+  if (!user || !is_user_vaddr(fault_addr))
+  {
+    /* This will PANIC if !user (f->cs == SEL_KCSEG)
+       or kill the process if user (f->cs == SEL_UCSEG) */
+    kill(f);
+    return;
+  }
+
+  /* Reject rights violations (e.g., write to read-only).
+     We only handle "not-present" faults for demand paging. */
+  if (!not_present)
+  {
+    /* This was a rights violation, not a "not-present" fault. */
+    kill (f);
+    return;
+  }
+  
+  /* At this point, we have a "not-present" fault in user mode
+     on a user virtual address. */
+
+  /* Look up the page metadata. */
+  struct page *p = page_for_addr (fault_addr);
+
+  /* If page doesn't exist, check for stack growth. */
+  if (p == NULL)
+    {
+      /* A valid stack access is:
+         1. Within STACK_MAX of PHYS_BASE.
+         2. "Near" the stack pointer (f->esp).
+            (The 32-byte PUSHA rule from the page.c comment). */
+      if (fault_addr >= (PHYS_BASE - STACK_MAX) && fault_addr >= f->esp - 32)
+        {
+          /* Valid stack growth. Allocate a new writable page. */
+          p = page_allocate (pg_round_down(fault_addr), false);
+        }
+    }
+  
+  /* If we have a page (either found or newly allocated) AND
+     we can successfully page it in, the fault is handled. */
+  if (p != NULL && page_in (fault_addr))
+    {
+      /* Success! Return to the user program to retry instruction. */
+      return;
+    }
+
+  /* If p is NULL (invalid access) or page_in failed (e.g., OOM),
+     we must kill the process. */
   printf ("Page fault at %p: %s error %s page in %s context.\n",
           fault_addr,
           not_present ? "not present" : "rights violation",
           write ? "writing" : "reading",
           user ? "user" : "kernel");
   kill (f);
+
+  /* --- END MODIFICATION --- */
 }
