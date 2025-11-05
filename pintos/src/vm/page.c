@@ -120,10 +120,11 @@ page_in (void *fault_addr)
   if (p->frame == NULL)
     {
       if (!do_page_in (p))
-      {
-        frame_unlock (p->frame); /* Must unlock even on failure */
-        return false;
-      }
+        {
+          /* do_page_in() failed and did not allocate a frame. */
+          /* Nothing to unlock in this case. */
+          return false;
+        }
     }
   ASSERT (lock_held_by_current_thread (&p->frame->lock));
 
@@ -149,52 +150,55 @@ page_out (struct page *p)
   ASSERT (p->frame != NULL);
   ASSERT (lock_held_by_current_thread (&p->frame->lock));
 
-  /* Mark page not present in page table, forcing accesses by the
-     process to fault.  This must happen before checking the
-     dirty bit, to prevent a race with the process dirtying the
-     page. */
+  /* Has the frame been modified?
+    Check the dirty bit before clearing the mapping so we don't
+    lose the information. Some implementations also consult the
+    kernel mapping of the frame base. */
+  dirty = pagedir_is_dirty (p->thread->pagedir, (const void *) p->addr)
+       || pagedir_is_dirty (p->thread->pagedir, (const void *) p->frame->base);
+
+  /* Now mark page not present in page table, forcing accesses by the
+    process to fault. */
   pagedir_clear_page(p->thread->pagedir, (void *) p->addr);
 
-  /* Has the frame been modified? */
-  /* If the frame has been modified, set 'dirty' to true. */
-  dirty = pagedir_is_dirty (p->thread->pagedir, (const void *) p->addr);
-
-  /* If the frame is not dirty (and file != NULL), we have sucsessfully evicted the page. */
-  if(!dirty)
-  {
-    ok = true;
-  }
-  
-  /* If the file is null, we definitely don't want to write the frame to disk. We must swap out the
-     frame and save whether or not the swap was successful. This could overwrite the previous value of
-     'ok'. */
+  /* Decide how to evict based on backing and dirtiness. */
   if (p->file == NULL)
-  {
-    ok = swap_out(p);
-  }
-  /* Otherwise, a file exists for this page. If file contents have been modified, then they must be
-     be written back to the file system on disk, or swapped out. This is determined by the private
-     variable associated with the page. */
-  else
-  {
-    if (dirty)
     {
-      if(p->private)
-      {
-        ok = swap_out(p);
-      }
-      else
-      {
-        ok = file_write_at(p->file, (const void *) p->frame->base, p->file_bytes, p->file_offset);
-      }
+      /* Anonymous page: if it was modified we must swap it out.
+         If it wasn't dirty, it was an all-zero page and can be dropped. */
+      ok = dirty ? swap_out (p) : true;
     }
-  }
+  else
+    {
+      /* File-backed page. */
+      if (dirty)
+        {
+          if (p->private)
+            {
+              /* Private (e.g., writable executable or mmaped private): swap out. */
+              ok = swap_out (p);
+            }
+          else
+            {
+              /* Shared and modified: write back to file. */
+              ok = file_write_at (p->file,
+                                  (const void *) p->frame->base,
+                                  p->file_bytes,
+                                  p->file_offset) == (off_t) p->file_bytes;
+            }
+        }
+      else
+        {
+          /* Not dirty: can just discard and re-fetch from file later. */
+          ok = true;
+        }
+    }
 
   /* Nullify the frame held by the page. */
-  if(ok)
-  {
-    p->frame = NULL;
-  }
+  if (ok)
+    {
+      p->frame = NULL;
+    }
   return ok;
 }
 

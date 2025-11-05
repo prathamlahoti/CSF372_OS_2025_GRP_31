@@ -88,8 +88,10 @@ try_frame_alloc_and_lock (struct page *page)
       /* Evict this frame. */
       if (!page_out (f->page))
         {
+          /* Could not evict (e.g., swap full). Try another frame. */
           lock_release (&f->lock);
-          return NULL;
+          lock_acquire (&scan_lock);
+          continue;
         }
 
       f->page = page;
