@@ -1,0 +1,137 @@
+Low-Level Design (LLD) — IPC Assignment (POSIX Message Queues)
+
+1. Implementation
+
+1.1 Overall architecture
++ Programs:
+    - `server.c` — single server process
+    - `client.c` — multiple client processes
++ Communication channels (POSIX message queues):
+    - `/server_queue` : all clients → server
+    - `/client_queue_<id>` : server → specific client
++ Document storage: server-only 10×10 grid of word cells
+
+1.2 Data structures
+
+On the server:
+
+Word cell (per-cell locking & ownership):
+
+typedef struct {
+        char data[MAX_STRING_LEN];
+        pthread_mutex_t lock;
+        int locked_by; /* -1 if free, else client_id */
+} WordCell;
+
+Grid representation:
+
+WordCell cells[10][10];
+
+Each cell has an associated mutex and an owner (`locked_by`).
+
+Message format (used by both client and server):
+
+typedef struct {
+        long mtype;
+        int client_id;
+        int line;       /* 0..9 */
+        int word_pos;   /* 0..9 */
+        char data[MAX_STRING_LEN];
+        int duration_ms;    /* for WRITE */
+        int response_code;  /* success/denied/etc. */
+} Message;
+
+1.3 Server logic
+
+Main loop
++ Use `mq_timedreceive()` to fetch requests (prevents indefinite blocking)
++ Switch on `mtype` and handle:
+    - `MSG_READ`
+    - `MSG_WRITE`
+    - `MSG_PRINT_DOC_READ`
+    - `MSG_UNLOCK`
+    - `MSG_SHUTDOWN`
+
+READ handling
++ Lock the target cell's mutex
++ If `locked_by == -1` (no writer) → return the current word (success)
++ Else → respond with `DENIED`
++ Unlock the cell mutex
+
+WRITE handling
++ Lock the target cell's mutex
++ If the cell is unlocked → set:
+    - `locked_by = client_id`
+    - `data = <string>` (copy new content)
+    - respond with `SUCCESS`
++ Else → respond with `DENIED`
++ Unlock the cell mutex
+
+UNLOCK handling
++ Client signals the end of its write duration
++ Server sets `locked_by = -1` for that cell
+
+PRINT_DOC reads
++ Treated like normal reads (per cell)
++ If a read is dropped, log:
+    Server: Client <id> PRINT_DOC READ(x,y) DROPPED
+
+Shutdown
++ Triggered by idle timeout or test-runner signal
++ On shutdown: write final document to `output.txt` and close queues
+
+1.4 Client logic
+
+Command execution
++ Client reads `input.txt`
++ Execute only lines prefixed with `C<client_id>`
++ Supported commands:
+    - `READ` — send request, wait for response, print result
+    - `WRITE` — send request, wait for success, sleep for `duration_ms`, then send `UNLOCK`
+    - `SLEEP` — local sleep (no messaging)
+
+Synchronization
++ Main thread and `print_doc` thread share the same client reply queue — protect access with a `comm_mutex` to prevent cross-consumption of replies
+
+`print_doc` thread
++ Runs every 2 seconds
++ For each of the 100 cells:
+    - Send `MSG_PRINT_DOC_READ`
+    - Update local cache on success or mark `"???"` on dropped read
+    - Write a snapshot to `output_client<id>.txt`
+
+2. Design choices & rationale
+
+2.1 Why POSIX message queues
++ Allowed by assignment; sockets are not permitted
++ Fixed-size binary message struct avoids text parsing
++ Built-in priorities and blocking simplify synchronization semantics
+
+2.2 Why per-word mutexes + `locked_by`
++ Requirement: concurrency at per-word granularity (not per-line or whole-document)
++ Per-cell mutex minimizes contention
++ `locked_by` encodes exclusive write ownership explicitly
++ Simpler than `pthread_rwlock_t` while meeting assignment semantics (reads allowed only when no writer exists)
+
+2.3 Why timed `mq_timedreceive()`
++ Prevents the server from blocking forever
++ Enables graceful shutdown after clients finish
++ Makes `print_doc` reads robust against slow or missing responses
+
+2.4 Why client-side `comm_mutex`
++ Both main and print threads use the same reply queue
++ `comm_mutex` prevents the print-doc response from being accidentally consumed by the main thread
+
+2.5 Why `print_doc` reads are per-cell (100 messages)
++ Matches the assignment requirement that print-doc reads behave like normal reads
++ Allows individual logging of dropped reads
++ Simplifies implementation — no bulk snapshot protocol required
+
+2.6 Why unlock is sent by the client
++ The server should not track client sleep durations
++ Client sleeps for the edit duration and explicitly sends `UNLOCK` — guaranteeing the write blocks access for exactly the requested time
+
+2.7 Why final output is written on shutdown
++ The test runner depends on final-document output behavior
++ Ensures the final document is consistent and chronologically correct
+
